@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from pants.engine.download_file import URLDownloadHandler
+from pants.engine.env_vars import EnvironmentVars, EnvironmentVarsRequest
 from pants.engine.fs import Digest, NativeDownloadFile
 from pants.engine.internals.native_engine import FileDigest
 from pants.engine.internals.selectors import Get
@@ -68,6 +69,20 @@ async def download_from_s3(
     request: S3DownloadFile, aws_credentials: AWSCredentials, global_options: GlobalOptions
 ) -> Digest:
     from botocore import auth, compat, exceptions  # pants: no-infer-dep
+
+    env_vars = await Get(
+        EnvironmentVars,
+        EnvironmentVarsRequest(requested=(
+            "AWS_PROFILE",
+            "AWS_REGION",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        )),
+    )
+    
+    logger.debug(f"env_vars: {env_vars}")
+
 
     # NB: The URL for auth is expected to be in path-style
     path_style_url = "https://s3"
