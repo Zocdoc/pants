@@ -23,6 +23,7 @@ use graph::{Graph, InvalidationResult};
 use hashing::Digest;
 use log::{Level, log};
 use parking_lot::Mutex;
+use pprof::ProfilerGuard;
 // use docker::docker::{self, DOCKER, IMAGE_PULL_CACHE};
 use docker::docker;
 use process_execution::switched::SwitchedCommandRunner;
@@ -79,6 +80,7 @@ pub struct Core {
     pub named_caches: NamedCaches,
     pub immutable_inputs: ImmutableInputs,
     pub local_execution_root_dir: PathBuf,
+    pub guard: Option<ProfilerGuard<'static>>,
 }
 
 #[derive(Clone, Debug)]
@@ -674,7 +676,7 @@ impl Core {
         };
 
         let sessions = Sessions::new(&executor)?;
-
+        
         Ok(Core {
             graph,
             tasks,
@@ -697,6 +699,7 @@ impl Core {
             named_caches,
             immutable_inputs,
             local_execution_root_dir,
+            guard: None,
         })
     }
 

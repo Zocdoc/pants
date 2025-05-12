@@ -94,6 +94,7 @@ watch = { path = "watch" }
 workunit_store = { path = "workunit_store" }
 remote = { path = "process_execution/remote" }
 pe_nailgun = { path = "process_execution/pe_nailgun" }
+pprof = { version = "0.14", features = ["flamegraph", "frame-pointer"] }
 
 [dev-dependencies]
 axum = { workspace = true }

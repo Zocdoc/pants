@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_latch::AsyncLatch;
 use fnv::FnvHasher;
@@ -1186,12 +1186,30 @@ fn scheduler_live_items<'py>(
 #[pyfunction]
 fn scheduler_shutdown(py: Python, py_scheduler: &Bound<'_, PyScheduler>, timeout_secs: u64) {
     let core = py_scheduler.borrow().0.core.clone();
-    core.executor.enter(|| {
+    let res = core.executor.enter(|| {
         py.allow_threads(|| {
             core.executor
                 .block_on(core.shutdown(Duration::from_secs(timeout_secs)));
         })
-    })
+    });
+
+    if let Some(guard) = &core.guard {
+        log::info!("Generating flamegraph.svg");
+
+        if let Ok(report) = guard.report().build() {
+            if let Ok(file) = File::create("flamegraph.svg") {
+                if let Err(e) = report.flamegraph(file) {
+                    log::warn!("Failed to generate flamegraph: {}", e);
+                }
+            } else {
+                log::warn!("Failed to create flamegraph.svg file");
+            }
+        } else {
+            log::warn!("Failed to build profiler report");
+        }
+    }
+
+    res
 }
 
 #[pyfunction]
@@ -1207,7 +1225,23 @@ fn scheduler_execute<'py>(
     let execution_request_cell = execution_request_cell_ref.0.get(py);
     let execution_request: &mut ExecutionRequest = &mut execution_request_cell.borrow_mut();
 
-    scheduler.core.executor.enter(|| {
+    log::info!("profiler: starting");
+    let guard = pprof::ProfilerGuardBuilder::default()
+    .frequency(1000)
+    .blocklist(&["libc", "libgcc", "pthread", "vdso", "libSystem", "system_malloc", "dyld"])
+    .build()
+    .map_or_else(
+        |_e| {
+            log::error!("profiler failed to start: {}", _e);
+            None
+        },
+        |guard| {
+            log::info!("profiler: started");
+            Some(guard)
+        },
+    );
+
+    let res = scheduler.core.executor.enter(|| {
         // TODO: A parent_id should be an explicit argument.
         session.workunit_store().init_thread_state(None);
 
@@ -1224,7 +1258,24 @@ fn scheduler_execute<'py>(
             .into_iter()
             .map(|root_result| py_result_from_root(py, root_result))
             .collect())
-    })
+    });
+
+    if let Some(guard) = guard {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let fpath = format!("profile_{}.svg", now);
+        log::info!("profiler: writing profile to {}", fpath.clone());
+        let file = File::create(fpath.clone()).unwrap();
+        let report = guard.report().build().unwrap();
+        report.flamegraph(file).unwrap();
+        log::info!("profiler: profile written to {}", fpath.clone());
+    } else {
+        log::info!("profiler: no profile to write");
+    }
+
+    return res;
 }
 
 #[pyfunction]
