@@ -6,6 +6,7 @@ import dataclasses
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
+import logging
 from pathlib import PurePath
 
 from pants.backend.javascript import install_node_package, nodejs_project_environment
@@ -13,7 +14,7 @@ from pants.backend.javascript.install_node_package import (
     InstalledNodePackage,
     InstalledNodePackageRequest,
 )
-from pants.backend.javascript.nodejs_project_environment import NodeJsProjectEnvironmentProcess
+from pants.backend.javascript.nodejs_project_environment import NodeJsProjectEnvironmentProcess, setup_nodejs_project_environment_process
 from pants.backend.javascript.package_json import (
     NodePackageNameField,
     NodePackageTestScriptField,
@@ -44,26 +45,18 @@ from pants.core.target_types import AssetSourceField
 from pants.core.util_rules import source_files
 from pants.core.util_rules.distdir import DistDir
 from pants.core.util_rules.partitions import Partition, PartitionerType, Partitions
-from pants.core.util_rules.source_files import SourceFiles, SourceFilesRequest
+from pants.core.util_rules.source_files import SourceFiles, SourceFilesRequest, determine_source_files
 from pants.engine.env_vars import EnvironmentVars, EnvironmentVarsRequest
-from pants.engine.fs import DigestSubset, GlobExpansionConjunction
+from pants.engine.fs import DigestSubset, GlobExpansionConjunction, PathGlobs
 from pants.engine.internals import graph, platform_rules
-from pants.engine.internals.native_engine import Digest, MergeDigests, Snapshot
-from pants.engine.internals.selectors import Get, MultiGet
-from pants.engine.process import (
-    Process,
-    ProcessCacheScope,
-    ProcessResultWithRetries,
-    ProcessWithRetries,
-)
-from pants.engine.rules import Rule, collect_rules, rule
-from pants.engine.target import (
-    Dependencies,
-    SourcesField,
-    Target,
-    TransitiveTargets,
-    TransitiveTargetsRequest,
-)
+from pants.engine.internals.graph import transitive_targets
+from pants.engine.internals.native_engine import MergeDigests, RemovePrefix, Snapshot
+from pants.engine.internals.platform_rules import environment_vars_subset
+from pants.engine.internals.selectors import Get, MultiGet, concurrently
+from pants.engine.intrinsics import digest_subset_to_digest, digest_to_snapshot, merge_digests, remove_prefix
+from pants.engine.process import ProcessCacheScope, ProcessResultWithRetries, ProcessWithRetries, execute_process_with_retry
+from pants.engine.rules import Rule, collect_rules, implicitly, rule
+from pants.engine.target import Dependencies, SourcesField, Target, TransitiveTargets, TransitiveTargetsRequest
 from pants.engine.unions import UnionRule
 from pants.util.dirutil import fast_relpath
 from pants.util.frozendict import FrozenDict
@@ -142,6 +135,7 @@ async def partition_nodejs_tests(
 
     return Partitions(partitions)
 
+logger = logging.getLogger(__name__)
 
 @rule(level=LogLevel.DEBUG, desc="Run javascript tests")
 async def run_javascript_tests(
@@ -177,9 +171,12 @@ async def run_javascript_tests(
                 TypeScriptSourceField,
                 AssetSourceField,
             ],
-        ),
+        )
     )
-    merged_digest = await Get(Digest, MergeDigests([sources.snapshot.digest, installation.digest]))
+    # merged_digest = await merge_digests(
+    #     MergeDigests([sources.snapshot.digest, installation.digest])
+    # )
+    merged_digest = sources.snapshot.digest
 
     def relative_package_dir(file: str) -> str:
         return fast_relpath(file, installation.project_env.package_dir())
@@ -207,8 +204,23 @@ async def run_javascript_tests(
     file_description = field_sets[0].address.spec
     if len(field_sets) > 1:
         file_description += f"+ {pluralize(len(field_sets) - 1, 'other file')}"
-    process = await Get(
-        Process,
+
+
+    # TODO this doesn't work because node_modules is
+    # 1. not the only thing in the installation digest
+    # 2. some of the other things in here are nested directories (from the monorepo)
+    # There nested directories really need to be merged with input digests but we don't have a way
+    # do do that right now.
+    node_modules = await digest_subset_to_digest(DigestSubset(installation.digest, PathGlobs(["node_modules/**"])))
+    node_modules_snapshot = await digest_to_snapshot(node_modules)
+    logger.debug(f"node_modules: {node_modules_snapshot.dirs}")
+
+    node_modules = await remove_prefix(RemovePrefix(node_modules, "node_modules"))
+    immutable_input_digest = FrozenDict({"node_modules": node_modules})
+
+    logger.debug(f"test_immutable_input_digest: {immutable_input_digest}")
+    
+    process = await setup_nodejs_project_environment_process(
         NodeJsProjectEnvironmentProcess(
             installation.project_env,
             args=(
@@ -223,6 +235,7 @@ async def run_javascript_tests(
             level=LogLevel.INFO,
             extra_env=FrozenDict(**test_extra_env.env, **target_env_vars),
             timeout_seconds=timeout_seconds,
+            immutable_input_digest=immutable_input_digest,
             output_files=tuple(
                 installation.join_relative_workspace_directory(file) for file in output_files or ()
             ),
@@ -231,6 +244,7 @@ async def run_javascript_tests(
                 for directory in output_directories or ()
             ),
         ),
+        **implicitly(),
     )
     if test.force:
         process = dataclasses.replace(process, cache_scope=ProcessCacheScope.PER_SESSION)

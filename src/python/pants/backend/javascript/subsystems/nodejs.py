@@ -286,7 +286,8 @@ class NodeJSToolProcess:
     timeout_seconds: int | None = None
     extra_env: Mapping[str, str] = field(default_factory=FrozenDict)
     project_digest: Digest | None = None
-
+    immutable_input_digest: Mapping[str, Digest] | None = None
+    
     @classmethod
     def npm(
         cls,
@@ -662,6 +663,7 @@ async def prepare_corepack_tool(
     )
     return CorepackToolDigest(result.output_digest)
 
+logger = logging.getLogger(__name__)
 
 @rule(level=LogLevel.DEBUG)
 async def setup_node_tool_process(
@@ -676,11 +678,18 @@ async def setup_node_tool_process(
         input_digest = await Get(Digest, MergeDigests([request.input_digest, corepack_tool.digest]))
     else:
         input_digest = request.input_digest
+    
+    immutable_input_digest = {
+        **environment.immutable_digest(),
+        **(request.immutable_input_digest or {}),
+    }
+    logger.debug(f"nodejs_immutable_input_digest: {immutable_input_digest}")
+
     return Process(
         argv=list(filter(None, (request.tool, *request.args))),
         input_digest=input_digest,
         output_files=request.output_files,
-        immutable_input_digests=environment.immutable_digest(),
+        immutable_input_digests=immutable_input_digest,
         output_directories=request.output_directories,
         description=request.description,
         level=request.level,

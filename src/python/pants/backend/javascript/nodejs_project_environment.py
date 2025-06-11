@@ -5,6 +5,7 @@ from __future__ import annotations
 import os.path
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import Mapping
 
 from pants.backend.javascript import package_json, resolve
 from pants.backend.javascript.nodejs_project import NodeJSProject
@@ -16,14 +17,14 @@ from pants.backend.javascript.package_json import (
 )
 from pants.backend.javascript.resolve import ChosenNodeResolve, RequestNodeResolve
 from pants.backend.javascript.subsystems import nodejs
-from pants.backend.javascript.subsystems.nodejs import NodeJSToolProcess
+from pants.backend.javascript.subsystems.nodejs import NodeJSToolProcess, setup_node_tool_process
 from pants.build_graph.address import Address
 from pants.engine.env_vars import EnvironmentVars, EnvironmentVarsRequest
 from pants.engine.fs import PathGlobs
 from pants.engine.internals.native_engine import EMPTY_DIGEST, Digest, MergeDigests
 from pants.engine.internals.selectors import Get, MultiGet
 from pants.engine.process import Process
-from pants.engine.rules import Rule, collect_rules, rule
+from pants.engine.rules import Rule, collect_rules, implicitly, rule
 from pants.engine.target import Target
 from pants.engine.unions import UnionRule
 from pants.util.dirutil import fast_relpath
@@ -95,6 +96,7 @@ class NodeJsProjectEnvironmentProcess:
     per_package_caches: FrozenDict[str, str] = field(default_factory=FrozenDict)
     timeout_seconds: int | None = None
     extra_env: FrozenDict[str, str] = field(default_factory=FrozenDict)
+    immutable_input_digest: Mapping[str, Digest] | None = None
 
     def targeted_args(self) -> tuple[str, ...]:
         if (
@@ -149,31 +151,34 @@ async def setup_nodejs_project_environment_process(
             for key, value in req.per_package_caches.items()
         }
     )
-    return await Get(
-        Process,
-        NodeJSToolProcess,
-        NodeJSToolProcess(
-            tool=req.env.project.package_manager.name,
-            tool_version=req.env.project.package_manager.version,
-            args=args,
-            description=req.description,
-            level=req.level,
-            input_digest=merged,
-            working_directory=req.env.root_dir,
-            output_files=output_files,
-            output_directories=output_directories,
-            append_only_caches=FrozenDict(**per_package_caches, **req.env.project.extra_caches()),
-            timeout_seconds=req.timeout_seconds,
-            project_digest=project_digest,
-            extra_env=FrozenDict(
-                {
-                    **subsystem_env_vars,
-                    **env_vars,
-                    **req.extra_env,
-                    **req.env.project.extra_env(),
-                }
-            ),
-        ),
+    return await setup_node_tool_process(
+        **implicitly(
+            NodeJSToolProcess(
+                tool=req.env.project.package_manager.name,
+                tool_version=req.env.project.package_manager.version,
+                args=args,
+                description=req.description,
+                level=req.level,
+                input_digest=merged,
+                working_directory=req.env.root_dir,
+                output_files=output_files,
+                output_directories=output_directories,
+                append_only_caches=FrozenDict(
+                    **per_package_caches, **req.env.project.extra_caches()
+                ),
+                timeout_seconds=req.timeout_seconds,
+                project_digest=project_digest,
+                immutable_input_digest=req.immutable_input_digest,
+                extra_env=FrozenDict(
+                    {
+                        **subsystem_env_vars,
+                        **env_vars,
+                        **req.extra_env,
+                        **req.env.project.extra_env(),
+                    }
+                ),
+            )
+        )
     )
 
 
