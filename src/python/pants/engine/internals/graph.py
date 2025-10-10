@@ -1207,7 +1207,7 @@ class Owners(FrozenOrderedSet[Address]):
     pass
 
 
-@rule
+@rule(desc="Find the owners of a file", level=LogLevel.INFO)
 def find_source_blocks_owners(
     request: TextBlocksOwnersRequest, mapping: FilenameTargetSourceBlocksMapping
 ) -> Owners:
@@ -1234,7 +1234,7 @@ def find_source_blocks_owners(
     return Owners(owners)
 
 
-@rule(desc="Find which targets own certain files", _masked_types=[EnvironmentName])
+@rule(desc="Find which targets own certain files", _masked_types=[EnvironmentName], level=LogLevel.INFO)
 async def find_owners(
     owners_request: OwnersRequest,
     local_environment_name: ChosenLocalEnvironmentName,

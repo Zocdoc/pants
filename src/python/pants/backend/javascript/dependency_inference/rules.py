@@ -5,15 +5,22 @@ from __future__ import annotations
 import itertools
 import logging
 import os.path
-from collections.abc import Iterable
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
+from typing import DefaultDict
 from dataclasses import dataclass
 from pathlib import PurePath
 
 from pants.backend.javascript import package_json
+from pants.core.util_rules.stripped_source_files import StrippedFileNameRequest, strip_file_name
+from pants.engine.target import AllTargets, Target
+from pants.util.frozendict import FrozenDict
+from pants.util.logging import LogLevel
 from pants.backend.javascript.package_json import (
     FirstPartyNodePackageTargets,
     NodePackageDependenciesField,
     NodePackageNameField,
+    NodeThirdPartyPackageNameField,
     OwningNodePackage,
     OwningNodePackageRequest,
     PackageJsonImports,
@@ -63,8 +70,10 @@ from pants.engine.target import (
 from pants.engine.unions import UnionRule
 from pants.util.docutil import doc_url
 from pants.util.frozendict import FrozenDict
+from pants.util.logging import LogLevel
 from pants.util.ordered_set import FrozenOrderedSet
 from pants.util.strutil import bullet_list, softwrap
+from pants.core.util_rules.source_files import SourceFilesRequest, determine_source_files
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +102,7 @@ class InferJSDependenciesRequest(InferDependenciesRequest):
     infer_from = JSSourceInferenceFieldSet
 
 
-@rule
+@rule(desc="infer node package dependencies", level=LogLevel.INFO)
 async def infer_node_package_dependencies(
     request: InferNodePackageDependenciesRequest,
     nodejs_infer: NodeJSInfer,
@@ -108,6 +117,61 @@ async def infer_node_package_dependencies(
     return InferredDependencies(
         tgt.address for tgt in js_targets if tgt.has_field(JSRuntimeSourceField)
     )
+
+
+@dataclass(frozen=True)
+class AllJavaScriptTargets:
+    """A collection of all JavaScript targets in the project, separated into first-party and third-party."""
+    first_party: tuple[Target, ...]  # JS/TS source targets
+    third_party: tuple[Target, ...]  # node_third_party_package targets
+
+
+@dataclass(frozen=True)
+class FirstPartyJavaScriptMapping:
+    """A mapping of file paths to their owning addresses."""
+
+    paths_to_addresses: FrozenDict[str, tuple[Address, ...]]
+
+    @classmethod
+    def create(
+        cls,
+        paths_to_addresses: Mapping[str, Iterable[Address]],
+    ) -> FirstPartyJavaScriptMapping:
+        return FirstPartyJavaScriptMapping(
+            FrozenDict(
+                (path, tuple(sorted(addresses))) 
+                for path, addresses in sorted(paths_to_addresses.items())
+            )
+        )
+
+    def get_addresses(self, file_paths: Iterable[str]) -> Addresses:
+        """Find all addresses that provide the given file paths."""
+        result: list[Address] = []
+        for file_path in file_paths:
+            # Get just the filename without extension
+            normalized_path = PurePath(file_path).name.rpartition('.')[0]
+            logger.info(f"Looking up normalized path: {normalized_path}")
+            # Find any stored paths that end with this filename
+            for stored_path, addresses in self.paths_to_addresses.items():
+                if stored_path.endswith(f"/{normalized_path}") or stored_path == normalized_path:
+                    result.extend(addresses)
+        logger.info(f"Found addresses: {result}")
+        return Addresses(result)
+
+
+def normalize_file_path(path: PurePath) -> str:
+    """Normalize a file path by removing extension and handling index files.
+    
+    Uses the full repository path to avoid conflicts between files with the same name
+    in different directories.
+    
+    For example:
+    - project1/src/components/Button.tsx -> project1/src/components/Button
+    - project2/src/components/index.ts -> project2/src/components
+    """
+    if path.name == "index.ts" or path.name == "index.js" or path.name == "index.tsx" or path.name == "index.jsx":
+        return path.parent.as_posix()
+    return path.with_suffix("").as_posix()
 
 
 class NodePackageCandidateMap(FrozenDict[str, Address]):
@@ -182,36 +246,33 @@ def _add_extensions(file_imports: frozenset[str], file_extensions: tuple[str, ..
 async def _determine_import_from_candidates(
     candidates: ParsedJavascriptDependencyCandidate,
     package_candidate_map: NodePackageCandidateMap,
-    file_extensions: tuple[str, ...],
+    first_party_mapping: FirstPartyJavaScriptMapping
 ) -> Addresses:
-    paths = await path_globs_to_paths(
-        _add_extensions(
-            candidates.file_imports,
-            file_extensions,
-        )
-    )
-    local_owners = await find_owners(OwnersRequest(paths.files), **implicitly())
-    owning_targets = await resolve_targets(**implicitly(Addresses(local_owners)))
 
-    addresses = Addresses(tgt.address for tgt in owning_targets)
-    if not local_owners:
-        non_path_string_bases = FrozenOrderedSet(
-            (
-                # Handle scoped packages like "@foo/bar"
-                # Ref: https://docs.npmjs.com/cli/v11/using-npm/scope
-                "/".join(non_path_string.split("/")[:2])
-                if non_path_string.startswith("@")
-                # Handle regular packages like "foo"
-                else non_path_string.partition("/")[0]
-            )
-            for non_path_string in candidates.package_imports
+    logger.info(f"Determining import from candidates: {candidates.file_imports} and {candidates.package_imports}")
+
+    # First check first-party mapping for file imports
+    addresses = first_party_mapping.get_addresses(candidates.file_imports)
+    if addresses:
+        return addresses
+
+    # If no first-party matches found, check third-party packages
+    non_path_string_bases = FrozenOrderedSet(
+        (
+            # Handle scoped packages like "@foo/bar"
+            # Ref: https://docs.npmjs.com/cli/v11/using-npm/scope
+            "/".join(non_path_string.split("/")[:2])
+            if non_path_string.startswith("@")
+            # Handle regular packages like "foo"
+            else non_path_string.partition("/")[0]
         )
-        addresses = Addresses(
-            package_candidate_map[pkg_name]
-            for pkg_name in non_path_string_bases
-            if pkg_name in package_candidate_map
-        )
-    return addresses
+        for non_path_string in candidates.package_imports
+    )
+    return Addresses(
+        package_candidate_map[pkg_name]
+        for pkg_name in non_path_string_bases
+        if pkg_name in package_candidate_map
+    )
 
 
 def _handle_unowned_imports(
@@ -246,10 +307,11 @@ def _is_node_builtin_module(import_string: str) -> bool:
     return import_string.startswith("node:")
 
 
-@rule
+@rule(desc="infer js source dependencies", level=LogLevel.INFO)
 async def infer_js_source_dependencies(
     request: InferJSDependenciesRequest,
     nodejs_infer: NodeJSInfer,
+    first_party_mapping: FirstPartyJavaScriptMapping,
 ) -> InferredDependencies:
     source: JSRuntimeSourceField = request.field_set.source
     if not nodejs_infer.imports:
@@ -273,12 +335,7 @@ async def infer_js_source_dependencies(
                 _determine_import_from_candidates(
                     candidates,
                     candidate_pkgs,
-                    file_extensions=(
-                        JS_FILE_EXTENSIONS
-                        + JSX_FILE_EXTENSIONS
-                        + TS_FILE_EXTENSIONS
-                        + TSX_FILE_EXTENSIONS
-                    ),
+                    first_party_mapping,
                 )
                 for string, candidates in import_strings.imports.items()
             ),
@@ -295,6 +352,47 @@ async def infer_js_source_dependencies(
     )
 
     return InferredDependencies(itertools.chain.from_iterable(imports.values()))
+
+
+@rule(desc="Find all JavaScript targets in project", level=LogLevel.DEBUG)
+async def find_all_javascript_targets(all_targets: AllTargets) -> AllJavaScriptTargets:
+    first_party = []
+    third_party = []
+    for tgt in all_targets:
+        if tgt.has_field(JSRuntimeSourceField):
+            first_party.append(tgt)
+        if tgt.has_field(NodeThirdPartyPackageNameField):
+            third_party.append(tgt)
+    return AllJavaScriptTargets(
+        tuple(sorted(first_party)), 
+        tuple(sorted(third_party))
+    )
+
+
+@rule(desc="Creating map of first party JavaScript targets to file paths", level=LogLevel.DEBUG)
+async def map_first_party_javascript_files(
+    all_js_targets: AllJavaScriptTargets,
+) -> FirstPartyJavaScriptMapping:
+    """Map first-party JavaScript targets to their file paths."""
+    logger.info(f"All JavaScript targets: {all_js_targets}")
+
+    # Get stripped file paths for all first-party targets
+    stripped_files = await concurrently(
+        strip_file_name(StrippedFileNameRequest(tgt[JSRuntimeSourceField].file_path))
+        for tgt in all_js_targets.first_party
+    )
+
+    logger.info(f"Stripped files: {stripped_files}")
+
+    # Map each file to its owning address
+    paths_to_addresses: DefaultDict[str, list[Address]] = defaultdict(list)
+
+    for tgt, stripped_file in zip(all_js_targets.first_party, stripped_files):
+        normalized_path = normalize_file_path(PurePath(stripped_file.value))
+        paths_to_addresses[normalized_path].append(tgt.address)
+
+    logger.info(f"Paths to addresses: {paths_to_addresses}")
+    return FirstPartyJavaScriptMapping.create(paths_to_addresses)
 
 
 def rules() -> Iterable[Rule | UnionRule]:
